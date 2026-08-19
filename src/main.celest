@@ -1,0 +1,426 @@
+import "std:HTTP";
+import "web-core" as web;
+
+function NativeServer(handle, port) {
+    this.handle = handle;
+    this.port = port;
+    this.closed = 0;
+    return;
+}
+
+function NativeSocket(handle) {
+    this.handle = handle;
+    this.state = 1;
+    this.writeHead = 0;
+    this.writeTail = 0;
+    return;
+}
+
+function NativeResponseStream(handle) {
+    this.handle = handle;
+    this.state = 1;
+    return;
+}
+
+async function nativeResponseStreamWrite(data) {
+    if (this.state != 1) throw "response stream is not writable";
+    this.state = 2;
+    try {
+        byte[1] written = await HTTP.connection_stream_write_async(
+            this.handle, data);
+        this.state = 1;
+        return written;
+    } catch error {
+        this.state = 4;
+        throw error;
+    }
+}
+
+async function nativeResponseStreamClose() {
+    if (this.state == 3) return 1;
+    if (this.state != 1) throw "response stream has a pending write";
+    this.state = 2;
+    try {
+        byte[1] closed = await HTTP.connection_stream_end_async(this.handle);
+        this.state = 3;
+        return closed;
+    } catch error {
+        this.state = 4;
+        throw error;
+    }
+}
+
+function queueSocketWrite(socket, opcode, data, code) {
+    byte[8] write = new Object();
+    write.opcode = opcode;
+    write.data = data;
+    write.code = code;
+    write.next = 0;
+    if (socket.writeTail == 0) socket.writeHead = (Object)write;
+    else socket.writeTail.next = (Object)write;
+    socket.writeTail = (Object)write;
+    return 1;
+}
+
+async function flushSocketWrites(socket) {
+    while (socket.writeHead != 0) {
+        byte[8] write = (Object)socket.writeHead;
+        socket.writeHead = write.next;
+        if (socket.writeHead == 0) socket.writeTail = 0;
+        if (write.opcode == 8)
+            await HTTP.websocket_close_async(socket.handle, write.code, write.data);
+        else await HTTP.websocket_write_async(socket.handle, write.opcode, write.data);
+    }
+    return 1;
+}
+
+function nativeSocketSend(data) {
+    if (this.state != 1) return 0;
+    return queueSocketWrite((Object)this, 1, data, 0);
+}
+
+function nativeSocketSendBinary(data) {
+    if (this.state != 1) return 0;
+    return queueSocketWrite((Object)this, 2, data, 0);
+}
+
+function nativeSocketPing(data) {
+    if (this.state != 1) return 0;
+    return queueSocketWrite((Object)this, 9, data, 0);
+}
+
+function nativeSocketPong(data) {
+    if (this.state != 1) return 0;
+    return queueSocketWrite((Object)this, 10, data, 0);
+}
+
+function nativeSocketClose(code, reason) {
+    if (this.state != 1) return 1;
+    this.state = 2;
+    queueSocketWrite((Object)this, 8, reason, code);
+    return;
+}
+
+async function serveWebSocket(context) {
+    byte[32] connection = context.connection;
+    byte[8] options = (Object)context.options;
+    if (Object.address(options, "protocol") != 0) await HTTP.connection_upgrade_async(connection, options.protocol);
+    else await HTTP.connection_upgrade_async(connection, "");
+    byte[8] socket = new NativeSocket(connection);
+    if (Object.address(options, "open") != 0) {
+        options.open((Object)socket);
+        await flushSocketWrites((Object)socket);
+    }
+    byte[8] maximum = 16777216;
+    if (Object.address(options, "maximumMessageSize") != 0) maximum = options.maximumMessageSize;
+    byte[8] running = 1;
+    while (running != 0 && socket.state == 1) {
+        byte[8] opcode = await HTTP.websocket_read_async(connection, maximum);
+        byte[8] frame = new Object();
+        frame.payload = HTTP.connection_value(connection, 6, "");
+        if (opcode == 1 || opcode == 2) {
+            if (Object.address(options, "message") != 0)
+                options.message((Object)socket, frame.payload, opcode == 2);
+            await flushSocketWrites((Object)socket);
+        } else if (opcode == 9) {
+            socket.pong(frame.payload);
+            await flushSocketWrites((Object)socket);
+        } else if (opcode == 10) {
+            if (Object.address(options, "pong") != 0)
+                options.pong((Object)socket, frame.payload);
+        } else if (opcode == 8) {
+            socket.close(HTTP.websocket_close_code(connection),
+                HTTP.websocket_close_reason(connection));
+            running = 0;
+        } else {
+            running = 0;
+        }
+    }
+    await flushSocketWrites((Object)socket);
+    socket.state = 3;
+    if (Object.address(options, "close") != 0) options.close((Object)socket, HTTP.websocket_close_code(connection), HTTP.websocket_close_reason(connection));
+    return 1;
+}
+
+async function closeWhenIdle(context) {
+    byte[1] idle = await context.idle;
+    byte[1] finalized = await HTTP.server_finalize_async(context.server.handle);
+    Async.resolve(context.closeDone, byte(01));
+    Async.resolve(context.done, byte(01));
+    return 1;
+}
+
+function nativeServerClose() {
+    if (this.closed != 0) return this.lifecycle.closeDone;
+    this.closed = 1;
+    byte[8] context = 0;
+    if (Object.address((Object)this, "lifecycle") != 0)
+        context = (Object)this.lifecycle;
+    else {
+        context = new Object();
+        context.done = Async.create();
+        context.requestLimit = 0;
+        context.server = (Object)this;
+        this.lifecycle = (Object)context;
+    }
+    if (context.requestLimit != 0) {
+        context.closeDone = HTTP.server_finalize_async(this.handle);
+        return context.closeDone;
+    }
+    context.closeDone = Async.create();
+    HTTP.server_stop(this.handle);
+    byte[32] idle = HTTP.server_idle_async(this.handle);
+    context.idle = idle;
+    byte[32] closing = closeWhenIdle((Object)context);
+    Async.detach(closing);
+    return context.closeDone;
+}
+
+function createNativeRequest(connection) {
+    byte[8] input = new Object();
+    input.method = HTTP.connection_value(connection, 0, "");
+    input.path = HTTP.connection_value(connection, 1, "");
+    input.streaming = HTTP.connection_body_streaming(connection);
+    if (input.streaming != 0) input.body = "";
+    else input.body = HTTP.connection_value(connection, 2, "");
+    byte[8] request = web.request(input.method, input.path, input.body);
+    request.bodyLength = HTTP.connection_body_length(connection);
+    request.streamingBody = input.streaming;
+    byte[8] connectionState = new Object();
+    connectionState.handle = connection;
+    connectionState.disconnectWatch = 0;
+    request.nativeState = (Object)connectionState;
+    if (input.streaming != 0) {
+        request.bodyComplete = HTTP.connection_body_complete(connection);
+        request.bodyReader = (Function)function(maximum) {
+            if (connectionState.disconnectWatch != 0) {
+                HTTP.connection_unwatch_disconnect(connectionState.handle,
+                    connectionState.disconnectWatch);
+                connectionState.disconnectWatch = 0;
+            }
+            return HTTP.connection_body_read_async(connectionState.handle, maximum);
+        };
+        request.bodyReadAll = (Function)function() {
+            if (connectionState.disconnectWatch != 0) {
+                HTTP.connection_unwatch_disconnect(connectionState.handle,
+                    connectionState.disconnectWatch);
+                connectionState.disconnectWatch = 0;
+            }
+            return HTTP.connection_body_read_all_async(connectionState.handle);
+        };
+        request.bodyCompleteResolver = (Function)function() {
+            return HTTP.connection_body_complete(connectionState.handle);
+        };
+    }
+    request.headerResolver = (Function)function(name) {
+        return HTTP.connection_value(connectionState.handle, 3, name);
+    };
+    request.queryResolver = (Function)function(name) {
+        return HTTP.connection_value(connectionState.handle, 4, name);
+    };
+    request.cookieResolver = (Function)function(name) {
+        return HTTP.connection_value(connectionState.handle, 5, name);
+    };
+    request.formResolver = (Function)function(name) {
+        return HTTP.connection_value(connectionState.handle, 7, name);
+    };
+    request.multipartResolver = (Function)function(name) {
+        return HTTP.connection_value(connectionState.handle, 8, name);
+    };
+    request.multipartNameResolver = (Function)function(name) {
+        return HTTP.connection_value(connectionState.handle, 9, name);
+    };
+    return (Object)request;
+}
+
+function responseShutdownRequested(response) {
+    if (Object.address((Object)response, "shutdownServer") == 0) return 0;
+    return response.shutdownServer;
+}
+
+function scheduleNextAccept(context, shutdownServer) {
+    if (context.autoAccept == 0 || shutdownServer != 0 ||
+        context.server.closed != 0) return 0;
+    if (context.requestLimit != 0 &&
+        HTTP.server_accept_limit_reached(context.server.handle,
+            context.requestLimit) != 0) return 0;
+    byte[32] accepting = context.accept((Object)context);
+    Async.detach(accepting);
+    return 1;
+}
+
+function prepareResponse(connection, response) {
+    byte[8] header = response.headerHead;
+    while (header != 0) {
+        HTTP.connection_response_header(connection, header.name, header.value);
+        header = (Object)header.next;
+    }
+    byte[8] trailer = response.trailerHead;
+    while (trailer != 0) {
+        HTTP.connection_response_trailer(connection, trailer.name, trailer.value);
+        trailer = (Object)trailer.next;
+    }
+    return HTTP.connection_keep_alive(connection);
+}
+
+async function acceptConnection(context) {
+    byte[32] connection = await HTTP.server_accept_async(context.server.handle);
+    try {
+        byte[8] running = 1;
+        while (running != 0) {
+            byte[8] request = createNativeRequest(connection);
+            byte[32] dispatching = context.app.dispatch((Object)request);
+            byte[8] disconnectWatch = HTTP.connection_watch_disconnect(
+                connection, dispatching);
+            request.nativeState.disconnectWatch = disconnectWatch;
+            byte[8] response = 0;
+            try {
+                response = await dispatching;
+            } finally {
+                if (disconnectWatch != 0)
+                    HTTP.connection_unwatch_disconnect(connection, disconnectWatch);
+            }
+            byte[8] shutdownServer = responseShutdownRequested((Object)response);
+            scheduleNextAccept((Object)context, shutdownServer);
+            if (response.websocket != 0) {
+                byte[8] websocket = new Object();
+                websocket.connection = connection;
+                websocket.options = response.websocket;
+                await serveWebSocket((Object)websocket);
+                HTTP.connection_close(connection);
+                return 1;
+            }
+            byte[8] keepAlive = prepareResponse(connection, (Object)response);
+            if (response.streamBody != 0) {
+                byte[1] started = await HTTP.connection_stream_begin_async(connection,
+                    response.status, response.contentType, keepAlive);
+                byte[8] stream = new NativeResponseStream(connection);
+                byte[8] production = new Object();
+                production.result = response.streamBody((Object)stream);
+                if (Async.is_task(production.result) != 0) await production.result;
+                if (stream.state == 1) await stream.close();
+                else if (stream.state != 3)
+                    throw "response stream producer left a pending write";
+            } else await HTTP.connection_respond_persistent_async(connection, response.status,
+                    response.body, response.contentType, keepAlive);
+            if (Object.address((Object)response, "afterSend") != 0)
+                response.afterSend();
+            if (keepAlive == 0) {
+                HTTP.connection_close(connection);
+                if (shutdownServer != 0) context.server.close();
+                return 1;
+            }
+            if (shutdownServer != 0) {
+                HTTP.connection_close(connection);
+                context.server.close();
+                return 1;
+            }
+            running = await HTTP.connection_next_request_async(connection);
+        }
+        HTTP.connection_close(connection);
+        return 1;
+    } catch error {
+        try {
+            await HTTP.connection_respond_persistent_async(connection, 500,
+                "Internal Server Error", "text/plain; charset=utf-8", 0);
+        } catch sendFailure {
+        }
+        HTTP.connection_close(connection);
+        return 1;
+    }
+}
+
+function nativeServerServeOne(app) {
+    byte[8] context = new Object();
+    context.server = (Object)this;
+    context.app = (Object)app;
+    context.autoAccept = 0;
+    context.accept = (Function)acceptConnection;
+    context.requestLimit = 1;
+    return acceptConnection((Object)context);
+}
+
+function nativeServerServe(options) {
+    if (Object.address((Object)this, "lifecycle") != 0)
+        return this.lifecycle.done;
+    byte[8] context = new Object();
+    byte[8] streamRequestBodies = 0;
+    if (Object.address((Object)options, "streamRequestBodies") != 0)
+        streamRequestBodies = options.streamRequestBodies;
+    HTTP.server_request_streaming(this.handle, streamRequestBodies);
+    context.server = (Object)this;
+    context.app = (Object)options.app;
+    context.autoAccept = 1;
+    context.accept = (Function)acceptConnection;
+    context.requestLimit = options.requestLimit;
+    byte[32] accepting = byte(00);
+    if (context.requestLimit == 0) {
+        context.done = Async.create();
+    } else {
+        context.done = Async.create();
+        HTTP.server_accept_limit(context.server.handle, context.done,
+            context.requestLimit);
+    }
+    accepting = acceptConnection((Object)context);
+    Async.detach(accepting);
+    this.lifecycle = (Object)context;
+    return context.done;
+}
+
+function nativeServerServeConcurrent(app, requestLimit, workerCount) {
+    byte[8] options = new Object();
+    options.app = app;
+    options.requestLimit = requestLimit;
+    return this.serve((Object)options);
+}
+
+function initializePrototype() {
+    byte[8] prototype = new Object();
+    prototype.close = (Function)nativeServerClose;
+    prototype.serveOne = (Function)nativeServerServeOne;
+    prototype.serve = (Function)nativeServerServe;
+    prototype.serveConcurrent = (Function)nativeServerServeConcurrent;
+    NativeServer.prototype = (Object)prototype;
+
+
+    byte[8] socketPrototype = new Object();
+    socketPrototype.send = (Function)nativeSocketSend;
+    socketPrototype.sendBinary = (Function)nativeSocketSendBinary;
+    socketPrototype.ping = (Function)nativeSocketPing;
+    socketPrototype.pong = (Function)nativeSocketPong;
+    socketPrototype.close = (Function)nativeSocketClose;
+    NativeSocket.prototype = (Object)socketPrototype;
+
+    byte[8] responseStreamPrototype = new Object();
+    responseStreamPrototype.write = (Function)nativeResponseStreamWrite;
+    responseStreamPrototype.close = (Function)nativeResponseStreamClose;
+    NativeResponseStream.prototype = (Object)responseStreamPrototype;
+    return 1;
+}
+
+byte[1] prototypeInitialized = initializePrototype();
+
+export function listen(host, port) {
+    byte[32] handle = HTTP.server();
+    byte[2] boundPort = HTTP.server_bind(handle, host, port);
+    return new NativeServer(handle, boundPort);
+}
+
+export function serve(app, host, port, requestLimit) {
+    byte[8] server = listen(host, port);
+    byte[8] options = new Object();
+    options.app = app;
+    options.requestLimit = requestLimit;
+    server.task = server.serve((Object)options);
+    return (Object)server;
+}
+
+test "creates and closes native listeners" {
+    byte[8] server = listen("127.0.0.1", 0);
+    if (server.port == 0) throw "native listener did not bind";
+    byte[32] closing = server.close();
+    byte[1] closed = Async.block_on(closing);
+    Async.close(closing);
+    if (closed != byte(01)) throw "native listener did not drain";
+    if (server.closed == 0) throw "native listener did not close";
+}
