@@ -1,5 +1,9 @@
 import "std:HTTP";
+import "std:TLS";
 import "web-core" as web;
+
+extern "C" function celest_cleanup_region_begin() -> byte[8]
+extern "C" function celest_cleanup_region_rollback(byte[8] region) -> byte[1]
 
 function NativeServer(handle, port) {
     this.handle = handle;
@@ -150,6 +154,138 @@ async function closeWhenIdle(context) {
     return 1;
 }
 
+function nativeServerSetTLS(options) {
+    if (Object.address((Object)options, "certificate") == 0)
+        throw "TLS certificate is required";
+    if (Object.address((Object)options, "key") == 0)
+        throw "TLS private key is required";
+    byte[32] context = TLS.server_context();
+    try {
+        if (Object.address((Object)options, "passphrase") != 0) {
+            byte[1] keyLoaded = TLS.key_loading(
+                context, options.key, options.passphrase);
+        } else {
+            byte[1] keyLoaded = TLS.key_loading(context, options.key, "");
+        }
+        byte[1] certificateLoaded = TLS.certificate_loading(
+            context, options.certificate);
+        HTTP.server_tls(this.handle, context);
+    } catch error {
+        byte[1] released = TLS.explicit_release(context);
+        throw error;
+    }
+    byte[1] released = TLS.explicit_release(context);
+    return 1;
+}
+
+function addHandler(context, handler) {
+    byte[32] emptyDeadline = byte(00);
+    handler.next = context.handlerHead;
+    handler.deadline = emptyDeadline;
+    handler.responseActive = 0;
+    handler.shutdownOwner = 0;
+    handler.abortRequested = 0;
+    context.handlerHead = (Object)handler;
+    return 1;
+}
+
+function removeHandler(context, handler) {
+    if (handler.deadline != 0) {
+        Async.deadline_close(handler.deadline);
+        byte[32] emptyDeadline = byte(00);
+        handler.deadline = emptyDeadline;
+    }
+    byte[8] previous = 0;
+    byte[8] current = context.handlerHead;
+    while (current != 0) {
+        byte[8] next = current.next;
+        if (current == handler) {
+            if (previous == 0) context.handlerHead = next;
+            else previous.next = next;
+            break;
+        }
+        previous = (Object)current;
+        current = (Object)next;
+    }
+    handler.next = 0;
+    return 1;
+}
+
+function deadlineHandlers(context) {
+    if (context.shutdownTimeoutMs == 0) return 0;
+    byte[8] handler = context.handlerHead;
+    while (handler != 0) {
+        byte[8] next = handler.next;
+        if (handler.routeActive == 0 && handler.responseActive != 0 &&
+            handler.deadline == 0 &&
+            Async.is_task(handler.task) != 0 && Async.state(handler.task) == 0)
+            handler.deadline = Async.deadline(handler.task,
+                context.shutdownTimeoutMs);
+        handler = (Object)next;
+    }
+    return 1;
+}
+
+function closeWaitingHandlers(context) {
+    byte[8] handler = context.handlerHead;
+    while (handler != 0) {
+        if (handler.routeActive == 0 && handler.responseActive == 0 &&
+            handler.shutdownOwner == 0 && handler.connection != 0 &&
+            handler.abortRequested == 0) {
+            handler.abortRequested = 1;
+            HTTP.connection_shutdown(handler.connection);
+            handler = context.handlerHead;
+        } else {
+            handler = (Object)handler.next;
+        }
+    }
+    return 1;
+}
+
+function addRoute(context, route) {
+    byte[32] emptyDeadline = byte(00);
+    route.next = context.routeHead;
+    route.deadline = emptyDeadline;
+    context.routeHead = (Object)route;
+    return 1;
+}
+
+function removeRoute(context, route) {
+    if (route.deadline != 0) {
+        Async.deadline_close(route.deadline);
+        byte[32] emptyDeadline = byte(00);
+        route.deadline = emptyDeadline;
+    }
+    byte[8] previous = 0;
+    byte[8] current = context.routeHead;
+    while (current != 0) {
+        byte[8] next = current.next;
+        if (current == route) {
+            if (previous == 0) context.routeHead = next;
+            else previous.next = next;
+            break;
+        }
+        previous = (Object)current;
+        current = (Object)next;
+    }
+    route.next = 0;
+    return 1;
+}
+
+function deadlineRoutes(context) {
+    if (context.shutdownTimeoutMs == 0) return 0;
+    byte[8] route = context.routeHead;
+    while (route != 0) {
+        byte[8] next = route.next;
+        if (route.deadline == 0 && Async.is_task(route.task) != 0 &&
+            Async.state(route.task) == 0)
+            route.deadline = Async.deadline(route.task,
+                context.shutdownTimeoutMs);
+        route = (Object)next;
+    }
+    return 1;
+}
+
 function nativeServerClose() {
     if (this.closed != 0) return this.lifecycle.closeDone;
     this.closed = 1;
@@ -160,6 +296,11 @@ function nativeServerClose() {
         context = new Object();
         context.done = Async.create();
         context.requestLimit = 0;
+        context.shutdownTimeoutMs = 0;
+        byte[8] emptyHandler = 0;
+        context.handlerHead = emptyHandler;
+        byte[8] emptyRoute = 0;
+        context.routeHead = emptyRoute;
         context.server = (Object)this;
         this.lifecycle = (Object)context;
     }
@@ -169,6 +310,9 @@ function nativeServerClose() {
     }
     context.closeDone = Async.create();
     HTTP.server_stop(this.handle);
+    closeWaitingHandlers((Object)context);
+    deadlineRoutes((Object)context);
+    deadlineHandlers((Object)context);
     byte[32] idle = HTTP.server_idle_async(this.handle);
     context.idle = idle;
     byte[32] closing = closeWhenIdle((Object)context);
@@ -176,60 +320,76 @@ function nativeServerClose() {
     return context.closeDone;
 }
 
-function createNativeRequest(connection) {
-    byte[8] input = new Object();
-    input.method = HTTP.connection_value(connection, 0, "");
-    input.path = HTTP.connection_value(connection, 1, "");
-    input.streaming = HTTP.connection_body_streaming(connection);
-    if (input.streaming != 0) input.body = "";
-    else input.body = HTTP.connection_value(connection, 2, "");
-    byte[8] request = web.request(input.method, input.path, input.body);
-    request.bodyLength = HTTP.connection_body_length(connection);
-    request.streamingBody = input.streaming;
-    byte[8] connectionState = new Object();
-    connectionState.handle = connection;
-    connectionState.disconnectWatch = 0;
-    request.nativeState = (Object)connectionState;
-    if (input.streaming != 0) {
-        request.bodyComplete = HTTP.connection_body_complete(connection);
-        request.bodyReader = (Function)function(maximum) {
-            if (connectionState.disconnectWatch != 0) {
-                HTTP.connection_unwatch_disconnect(connectionState.handle,
-                    connectionState.disconnectWatch);
-                connectionState.disconnectWatch = 0;
-            }
-            return HTTP.connection_body_read_async(connectionState.handle, maximum);
-        };
-        request.bodyReadAll = (Function)function() {
-            if (connectionState.disconnectWatch != 0) {
-                HTTP.connection_unwatch_disconnect(connectionState.handle,
-                    connectionState.disconnectWatch);
-                connectionState.disconnectWatch = 0;
-            }
-            return HTTP.connection_body_read_all_async(connectionState.handle);
-        };
-        request.bodyCompleteResolver = (Function)function() {
-            return HTTP.connection_body_complete(connectionState.handle);
-        };
+function nativeRequestBodyRead(request, maximum) {
+    if (request.disconnectWatch != 0) {
+        HTTP.connection_unwatch_disconnect(request.nativeConnection,
+            request.disconnectWatch);
+        request.disconnectWatch = 0;
     }
-    request.headerResolver = (Function)function(name) {
-        return HTTP.connection_value(connectionState.handle, 3, name);
-    };
-    request.queryResolver = (Function)function(name) {
-        return HTTP.connection_value(connectionState.handle, 4, name);
-    };
-    request.cookieResolver = (Function)function(name) {
-        return HTTP.connection_value(connectionState.handle, 5, name);
-    };
-    request.formResolver = (Function)function(name) {
-        return HTTP.connection_value(connectionState.handle, 7, name);
-    };
-    request.multipartResolver = (Function)function(name) {
-        return HTTP.connection_value(connectionState.handle, 8, name);
-    };
-    request.multipartNameResolver = (Function)function(name) {
-        return HTTP.connection_value(connectionState.handle, 9, name);
-    };
+    return HTTP.connection_body_read_async(request.nativeConnection, maximum);
+}
+
+function nativeRequestBodyReadAll(request) {
+    if (request.disconnectWatch != 0) {
+        HTTP.connection_unwatch_disconnect(request.nativeConnection,
+            request.disconnectWatch);
+        request.disconnectWatch = 0;
+    }
+    return HTTP.connection_body_read_all_async(request.nativeConnection);
+}
+
+function nativeRequestBodyComplete(request) {
+    return HTTP.connection_body_complete(request.nativeConnection);
+}
+
+function nativeRequestHeader(request, name) {
+    return HTTP.connection_value(request.nativeConnection, 3, name);
+}
+
+function nativeRequestQuery(request, name) {
+    return HTTP.connection_value(request.nativeConnection, 4, name);
+}
+
+function nativeRequestCookie(request, name) {
+    return HTTP.connection_value(request.nativeConnection, 5, name);
+}
+
+function nativeRequestForm(request, name) {
+    return HTTP.connection_value(request.nativeConnection, 7, name);
+}
+
+function nativeRequestMultipart(request, name) {
+    return HTTP.connection_value(request.nativeConnection, 8, name);
+}
+
+function nativeRequestMultipartName(request, name) {
+    return HTTP.connection_value(request.nativeConnection, 9, name);
+}
+
+function createNativeRequest(connection, requestPrototype) {
+    byte[8] streaming = HTTP.connection_body_streaming(connection);
+    byte[8] request = 0;
+    if (streaming == 0)
+        request = HTTP.connection_request(connection, requestPrototype);
+    else {
+        request = web.request(HTTP.connection_value(connection, 0, ""),
+            HTTP.connection_value(connection, 1, ""), "");
+        request.bodyLength = HTTP.connection_body_length(connection);
+        request.streamingBody = 1;
+        request.nativeConnection = connection;
+        request.disconnectWatch = 0;
+        request.nativeState = (Object)request;
+        request.bodyComplete = HTTP.connection_body_complete(connection);
+        request.bodyReader = (Function)nativeRequestBodyRead;
+        request.bodyReadAll = (Function)nativeRequestBodyReadAll;
+        request.bodyCompleteResolver = (Function)nativeRequestBodyComplete;
+    }
+    request.headerResolver = (Function)nativeRequestHeader;
+    request.queryResolver = (Function)nativeRequestQuery;
+    request.cookieResolver = (Function)nativeRequestCookie;
+    request.formResolver = (Function)nativeRequestForm;
+    request.multipartResolver = (Function)nativeRequestMultipart;
+    request.multipartNameResolver = (Function)nativeRequestMultipartName;
     return (Object)request;
 }
 
@@ -240,12 +400,35 @@ function responseShutdownRequested(response) {
 
 function scheduleNextAccept(context, shutdownServer) {
     if (context.autoAccept == 0 || shutdownServer != 0 ||
-        context.server.closed != 0) return 0;
+        context.server.closed != 0 || context.stopping != 0)
+        return 0;
+    byte[8] capacity = context.maxConnections;
+    if (context.rejectOverload != 0)
+        capacity = capacity + context.maxPendingRejections;
+    if (context.pendingAccepts != 0 ||
+        context.activeConnections + context.rejectingConnections >= capacity)
+        return 0;
     if (context.requestLimit != 0 &&
-        HTTP.server_accept_limit_reached(context.server.handle,
-            context.requestLimit) != 0) return 0;
-    byte[32] accepting = context.accept((Object)context);
-    Async.detach(accepting);
+        context.acceptedConnections + context.pendingAccepts >=
+            context.requestLimit) return 0;
+    context.pendingAccepts = context.pendingAccepts + 1;
+    byte[8] handler = new Object();
+    handler.connection = 0;
+    handler.routeActive = 0;
+    addHandler((Object)context, (Object)handler);
+    handler.task = context.accept((Object)context, (Object)handler);
+    Async.detach(handler.task);
+    return 1;
+}
+
+function resolveBoundedServer(context) {
+    if (context.autoAccept == 0 || context.requestLimit == 0 ||
+        context.boundedResolved != 0 ||
+        context.acceptedConnections < context.requestLimit ||
+        context.activeConnections != 0 || context.rejectingConnections != 0 ||
+        context.pendingAccepts != 0) return 0;
+    context.boundedResolved = 1;
+    Async.resolve(context.done, byte(01));
     return 1;
 }
 
@@ -263,31 +446,90 @@ function prepareResponse(connection, response) {
     return HTTP.connection_keep_alive(connection);
 }
 
-async function acceptConnection(context) {
-    byte[32] connection = await HTTP.server_accept_async(context.server.handle);
+async function serveConnection(context, handler) {
+    byte[32] connection = byte(00);
     try {
+        connection = await HTTP.server_accept_socket_async(context.server.handle);
+    } catch acceptFailure {
+        context.pendingAccepts = context.pendingAccepts - 1;
+        scheduleNextAccept((Object)context, 0);
+        return 0;
+    }
+    context.pendingAccepts = context.pendingAccepts - 1;
+    context.acceptedConnections = context.acceptedConnections + 1;
+    handler.connection = connection;
+    if (context.activeConnections >= context.maxConnections) {
+        context.rejectingConnections = context.rejectingConnections + 1;
+        scheduleNextAccept((Object)context, 0);
+        try {
+            try {
+                byte[1] ready = await HTTP.connection_request_async(connection);
+                if (ready == 0) return 0;
+            } catch requestFailure {
+                return 0;
+            }
+            byte[1] rejected = await HTTP.connection_reject_overload_async(
+                connection, context.retryAfterSeconds);
+        } finally {
+            HTTP.connection_close(connection);
+            context.rejectingConnections = context.rejectingConnections - 1;
+            scheduleNextAccept((Object)context, 0);
+            resolveBoundedServer((Object)context);
+        }
+        return 0;
+    }
+    context.activeConnections = context.activeConnections + 1;
+    scheduleNextAccept((Object)context, 0);
+    try {
+        try {
+            byte[1] ready = await HTTP.connection_request_async(connection);
+            if (ready == 0) return 0;
+        } catch requestFailure {
+            return 0;
+        }
         byte[8] running = 1;
         while (running != 0) {
-            byte[8] request = createNativeRequest(connection);
-            byte[32] dispatching = context.app.dispatch((Object)request);
-            byte[8] disconnectWatch = HTTP.connection_watch_disconnect(
-                connection, dispatching);
-            request.nativeState.disconnectWatch = disconnectWatch;
-            byte[8] response = 0;
+            byte[8] requestRegion = celest_cleanup_region_begin();
             try {
-                response = await dispatching;
-            } finally {
-                if (disconnectWatch != 0)
-                    HTTP.connection_unwatch_disconnect(connection, disconnectWatch);
+            byte[8] request = createNativeRequest(connection,
+                context.requestPrototype);
+            byte[8] dispatch = new Object();
+            dispatch.result = context.app.dispatchFast((Object)request);
+            byte[8] response = 0;
+            if (Async.is_task(dispatch.result) != 0) {
+                handler.routeActive = 1;
+                byte[8] route = new Object();
+                route.task = dispatch.result;
+                addRoute((Object)context, (Object)route);
+                byte[32] requestDeadline = byte(00);
+                if (context.requestTimeoutMs != 0)
+                    requestDeadline = Async.deadline(route.task,
+                        context.requestTimeoutMs);
+                byte[8] disconnectWatch = HTTP.connection_watch_disconnect(
+                    connection, route.task);
+                request.nativeState.disconnectWatch = disconnectWatch;
+                try {
+                    response = await route.task;
+                } finally {
+                    if (disconnectWatch != 0)
+                        HTTP.connection_unwatch_disconnect(connection,
+                            disconnectWatch);
+                    if (requestDeadline != 0)
+                        Async.deadline_close(requestDeadline);
+                    removeRoute((Object)context, (Object)route);
+                    handler.routeActive = 0;
+                }
+            } else {
+                response = dispatch.result;
             }
+            handler.responseActive = 1;
             byte[8] shutdownServer = responseShutdownRequested((Object)response);
-            scheduleNextAccept((Object)context, shutdownServer);
+            if (shutdownServer != 0) context.stopping = 1;
             if (response.websocket != 0) {
                 byte[8] websocket = new Object();
                 websocket.connection = connection;
                 websocket.options = response.websocket;
                 await serveWebSocket((Object)websocket);
-                HTTP.connection_close(connection);
                 return 1;
             }
             byte[8] keepAlive = prepareResponse(connection, (Object)response);
@@ -306,27 +548,46 @@ async function acceptConnection(context) {
             if (Object.address((Object)response, "afterSend") != 0)
                 response.afterSend();
             if (keepAlive == 0) {
-                HTTP.connection_close(connection);
-                if (shutdownServer != 0) context.server.close();
+                if (shutdownServer != 0) {
+                    handler.shutdownOwner = 1;
+                    context.server.close();
+                }
                 return 1;
             }
             if (shutdownServer != 0) {
-                HTTP.connection_close(connection);
+                handler.shutdownOwner = 1;
                 context.server.close();
                 return 1;
             }
+            handler.responseActive = 0;
             running = await HTTP.connection_next_request_async(connection);
+            } finally {
+                celest_cleanup_region_rollback(requestRegion);
+            }
         }
-        HTTP.connection_close(connection);
         return 1;
     } catch error {
-        try {
-            await HTTP.connection_respond_persistent_async(connection, 500,
-                "Internal Server Error", "text/plain; charset=utf-8", 0);
-        } catch sendFailure {
+        if (error != "Task cancelled") {
+            try {
+                await HTTP.connection_respond_persistent_async(connection, 500,
+                    "Internal Server Error", "text/plain; charset=utf-8", 0);
+            } catch sendFailure {
+            }
         }
-        HTTP.connection_close(connection);
         return 1;
+    } finally {
+        HTTP.connection_close(connection);
+        context.activeConnections = context.activeConnections - 1;
+        scheduleNextAccept((Object)context, 0);
+        resolveBoundedServer((Object)context);
+    }
+}
+
+async function acceptConnection(context, handler) {
+    try {
+        return await serveConnection((Object)context, (Object)handler);
+    } finally {
+        removeHandler((Object)context, (Object)handler);
     }
 }
 
@@ -334,35 +595,111 @@ function nativeServerServeOne(app) {
     byte[8] context = new Object();
     context.server = (Object)this;
     context.app = (Object)app;
+    context.requestPrototype = web.requestPrototype();
     context.autoAccept = 0;
     context.accept = (Function)acceptConnection;
     context.requestLimit = 1;
-    return acceptConnection((Object)context);
+    context.maxConnections = 1;
+    context.activeConnections = 0;
+    context.acceptedConnections = 0;
+    context.pendingAccepts = 1;
+    context.stopping = 0;
+    context.rejectOverload = 0;
+    context.retryAfterSeconds = 1;
+    context.rejectingConnections = 0;
+    context.maxPendingRejections = 1;
+    context.boundedResolved = 0;
+    context.requestTimeoutMs = 0;
+    context.shutdownTimeoutMs = 0;
+    byte[8] emptyHandler = 0;
+    context.handlerHead = emptyHandler;
+    byte[8] emptyRoute = 0;
+    context.routeHead = emptyRoute;
+    byte[8] handler = new Object();
+    handler.connection = 0;
+    handler.routeActive = 0;
+    addHandler((Object)context, (Object)handler);
+    handler.task = acceptConnection((Object)context, (Object)handler);
+    return handler.task;
 }
 
 function nativeServerServe(options) {
     if (Object.address((Object)this, "lifecycle") != 0)
         return this.lifecycle.done;
     byte[8] context = new Object();
+    if (Object.address((Object)options, "tls") != 0)
+        this.setTLS((Object)options.tls);
     byte[8] streamRequestBodies = 0;
     if (Object.address((Object)options, "streamRequestBodies") != 0)
         streamRequestBodies = options.streamRequestBodies;
     HTTP.server_request_streaming(this.handle, streamRequestBodies);
+    byte[8] headerTimeoutMs = 10000;
+    byte[8] bodyTimeoutMs = 30000;
+    byte[8] writeTimeoutMs = 30000;
+    byte[8] idleTimeoutMs = 60000;
+    byte[8] maxConnections = 128;
+    byte[8] rejectOverload = 0;
+    byte[8] retryAfterSeconds = 1;
+    byte[8] maxPendingRejections = 32;
+    byte[8] requestTimeoutMs = 0;
+    byte[8] shutdownTimeoutMs = 30000;
+    if (Object.address((Object)options, "headerTimeoutMs") != 0)
+        headerTimeoutMs = options.headerTimeoutMs;
+    if (Object.address((Object)options, "bodyTimeoutMs") != 0)
+        bodyTimeoutMs = options.bodyTimeoutMs;
+    if (Object.address((Object)options, "writeTimeoutMs") != 0)
+        writeTimeoutMs = options.writeTimeoutMs;
+    if (Object.address((Object)options, "idleTimeoutMs") != 0)
+        idleTimeoutMs = options.idleTimeoutMs;
+    if (Object.address((Object)options, "maxConnections") != 0)
+        maxConnections = options.maxConnections;
+    if (Object.address((Object)options, "rejectOverload") != 0)
+        rejectOverload = options.rejectOverload;
+    if (Object.address((Object)options, "retryAfterSeconds") != 0)
+        retryAfterSeconds = options.retryAfterSeconds;
+    if (Object.address((Object)options, "maxPendingRejections") != 0)
+        maxPendingRejections = options.maxPendingRejections;
+    if (Object.address((Object)options, "requestTimeoutMs") != 0)
+        requestTimeoutMs = options.requestTimeoutMs;
+    if (Object.address((Object)options, "shutdownTimeoutMs") != 0)
+        shutdownTimeoutMs = options.shutdownTimeoutMs;
+    if (maxConnections <= 0) throw "maxConnections must be positive";
+    if (rejectOverload != 0 && rejectOverload != 1)
+        throw "rejectOverload must be zero or one";
+    if (retryAfterSeconds < 0)
+        throw "retryAfterSeconds must not be negative";
+    if (maxPendingRejections <= 0)
+        throw "maxPendingRejections must be positive";
+    if (requestTimeoutMs < 0)
+        throw "requestTimeoutMs must not be negative";
+    if (shutdownTimeoutMs < 0)
+        throw "shutdownTimeoutMs must not be negative";
+    HTTP.server_timeouts(this.handle, headerTimeoutMs, bodyTimeoutMs,
+        writeTimeoutMs, idleTimeoutMs);
     context.server = (Object)this;
     context.app = (Object)options.app;
+    context.requestPrototype = web.requestPrototype();
     context.autoAccept = 1;
     context.accept = (Function)acceptConnection;
     context.requestLimit = options.requestLimit;
-    byte[32] accepting = byte(00);
-    if (context.requestLimit == 0) {
-        context.done = Async.create();
-    } else {
-        context.done = Async.create();
-        HTTP.server_accept_limit(context.server.handle, context.done,
-            context.requestLimit);
-    }
-    accepting = acceptConnection((Object)context);
-    Async.detach(accepting);
+    context.maxConnections = maxConnections;
+    context.activeConnections = 0;
+    context.acceptedConnections = 0;
+    context.pendingAccepts = 0;
+    context.stopping = 0;
+    context.rejectOverload = rejectOverload;
+    context.retryAfterSeconds = retryAfterSeconds;
+    context.rejectingConnections = 0;
+    context.maxPendingRejections = maxPendingRejections;
+    context.boundedResolved = 0;
+    context.requestTimeoutMs = requestTimeoutMs;
+    context.shutdownTimeoutMs = shutdownTimeoutMs;
+    byte[8] emptyHandler = 0;
+    context.handlerHead = emptyHandler;
+    byte[8] emptyRoute = 0;
+    context.routeHead = emptyRoute;
+    context.done = Async.create();
+    scheduleNextAccept((Object)context, 0);
     this.lifecycle = (Object)context;
     return context.done;
 }
@@ -377,6 +714,7 @@ function nativeServerServeConcurrent(app, requestLimit, workerCount) {
 function initializePrototype() {
     byte[8] prototype = new Object();
     prototype.close = (Function)nativeServerClose;
+    prototype.setTLS = (Function)nativeServerSetTLS;
     prototype.serveOne = (Function)nativeServerServeOne;
     prototype.serve = (Function)nativeServerServe;
     prototype.serveConcurrent = (Function)nativeServerServeConcurrent;
