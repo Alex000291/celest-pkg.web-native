@@ -384,6 +384,8 @@ function createNativeRequest(connection, requestPrototype) {
         request.bodyReadAll = (Function)nativeRequestBodyReadAll;
         request.bodyCompleteResolver = (Function)nativeRequestBodyComplete;
     }
+    request.rawPath = HTTP.connection_raw_target(connection);
+    request.headers = HTTP.connection_headers(connection);
     request.headerResolver = (Function)nativeRequestHeader;
     request.queryResolver = (Function)nativeRequestQuery;
     request.cookieResolver = (Function)nativeRequestCookie;
@@ -433,6 +435,9 @@ function resolveBoundedServer(context) {
 }
 
 function prepareResponse(connection, response) {
+    if (Object.address((Object)response, "upstreamHeaders") != 0 &&
+        response.upstreamHeaders != 0)
+        HTTP.connection_response_headers(connection, response.upstreamHeaders);
     byte[8] header = response.headerHead;
     while (header != 0) {
         HTTP.connection_response_header(connection, header.name, header.value);
